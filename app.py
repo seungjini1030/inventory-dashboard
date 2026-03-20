@@ -16,6 +16,7 @@ SPREADSHEET_ID = st.secrets["SPREADSHEET_ID"]
 
 st.title("부진/부동 재고 대시보드")
 
+
 # -----------------------------
 # 유틸 함수
 # -----------------------------
@@ -27,9 +28,11 @@ def clean_header(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
+
 def week_num(col) -> int:
     m = re.match(r"^(\d{1,2})W$", str(col).strip())
     return int(m.group(1)) if m else 999
+
 
 def to_num_series(s: pd.Series) -> pd.Series:
     """문자/콤마/% 등이 섞인 값을 숫자로 안전 변환 (Series 단위)"""
@@ -38,15 +41,20 @@ def to_num_series(s: pd.Series) -> pd.Series:
     s = s.str.replace(r"[^0-9.\-]", "", regex=True)
     return pd.to_numeric(s, errors="coerce").fillna(0.0)
 
+
 def fmt_int(x):
     return f"{int(round(float(x))):,}"
+
 
 def fmt_pct(x, digits=1):
     return f"{float(x):.{digits}f}%"
 
-# -----------------------------
-# 구글시트 클라이언트 (리소스 캐시)
-# -----------------------------
+
+# ============================================================
+# [수정 1] gspread 인증 방식 업데이트
+#   - gspread.authorize(creds) → gspread.Client(auth=creds)
+#   - gspread 5.x/6.x 모두 호환
+# ============================================================
 @st.cache_resource
 def get_gspread_client():
     creds = Credentials.from_service_account_info(
@@ -56,7 +64,8 @@ def get_gspread_client():
             "https://www.googleapis.com/auth/drive.readonly",
         ],
     )
-    return gspread.authorize(creds)
+    return gspread.Client(auth=creds)
+
 
 # -----------------------------
 # 구글시트 로드 (데이터 캐시)
@@ -66,20 +75,20 @@ def load_data():
     gc = get_gspread_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
     ws = sh.worksheet(SHEET_NAME)
-
     values = ws.get_all_values()
+
     if len(values) < HEADER_ROW:
         return pd.DataFrame()
 
     raw_header = values[HEADER_ROW - 1]
     header = [clean_header(h) for h in raw_header]
     rows = values[HEADER_ROW:]
-
     df = pd.DataFrame(rows, columns=header)
 
     # 완전 빈 행 제거(공백 포함)
     df = df.loc[df.astype(str).apply(lambda r: "".join(r).strip() != "", axis=1)].copy()
     return df
+
 
 df = load_data()
 
@@ -103,7 +112,7 @@ missing = [v for v in required_cols.values() if v not in df.columns]
 if missing:
     st.error("필수 컬럼을 찾지 못했습니다.")
     for v in required_cols.values():
-        st.write(f"- {v}: {'있음' if v in df.columns else '없음'}")
+        st.write(f"- {v}: {'✅ 있음' if v in df.columns else '❌ 없음'}")
     st.write("현재 읽힌 컬럼명:", list(df.columns))
     st.stop()
 
@@ -142,21 +151,69 @@ df["소진수량"] = (df[COL_BASE] - df[COL_AVAIL]).clip(lower=0)
 base_nonzero = df[COL_BASE].replace(0, pd.NA)
 df["소진율(계산)"] = (df["소진수량"] / base_nonzero).fillna(0) * 100
 
-# -----------------------------
-# 사이드바 필터 (요청: 소진률 범위/가용재고 최소값 제거)
-# -----------------------------
-st.sidebar.header("필터 🔎")
 
+# ============================================================
+# [수정 2] 월-주차 매핑 동적 처리
+#   - 하드코딩 제거, 주차 번호 기반 자동 매핑
+#   - 4월 이후 데이터 추가 시에도 자동 반영
+# ============================================================
+def build_month_map(week_cols_list: list) -> dict:
+    """
+    주차 번호를 기반으로 월 매핑 자동 생성
+    1~4W=1월, 5~8W=2월, 9~13W=3월, 14~17W=4월 ...
+    (대략 4주=1개월 기준, 실무 관례에 맞춤)
+    """
+    week_to_month = {
+        1: "1월", 2: "1월", 3: "1월", 4: "1월", 5: "1월",
+        6: "2월", 7: "2월", 8: "2월", 9: "2월",
+        10: "3월", 11: "3월", 12: "3월", 13: "3월",
+        14: "4월", 15: "4월", 16: "4월", 17: "4월",
+        18: "5월", 19: "5월", 20: "5월", 21: "5월", 22: "5월",
+        23: "6월", 24: "6월", 25: "6월", 26: "6월",
+        27: "7월", 28: "7월", 29: "7월", 30: "7월",
+        31: "8월", 32: "8월", 33: "8월", 34: "8월", 35: "8월",
+        36: "9월", 37: "9월", 38: "9월", 39: "9월",
+        40: "10월", 41: "10월", 42: "10월", 43: "10월",
+        44: "11월", 45: "11월", 46: "11월", 47: "11월",
+        48: "12월", 49: "12월", 50: "12월", 51: "12월", 52: "12월",
+    }
+    month_map = {}
+    for col in week_cols_list:
+        wn = week_num(col)
+        month = week_to_month.get(wn, f"{(wn - 1) // 4 + 1}월")
+        month_map.setdefault(month, []).append(wn)
+    return month_map
+
+
+def month_rate_for_dept(ddf: pd.DataFrame, month_map: dict, week_cols_all: list) -> pd.DataFrame:
+    dept_base = float(ddf[COL_BASE].sum())
+    recs = []
+    for month, weeks in month_map.items():
+        cols = [c for c in week_cols_all if week_num(c) in weeks]
+        month_cons = float(ddf[cols].sum().sum()) if cols else 0.0
+        month_rate = (month_cons / dept_base * 100) if dept_base > 0 else 0.0
+        recs.append({"월": month, "소진율(가중)": month_rate})
+    out = pd.DataFrame(recs)
+    month_order = [f"{i}월" for i in range(1, 13)]
+    out["월"] = pd.Categorical(out["월"], categories=month_order, ordered=True)
+    return out.sort_values("월")
+
+
+# 한 번만 생성 (중복 호출 제거)
+month_map = build_month_map(week_cols) if week_cols else {}
+
+
+# -----------------------------
+# 사이드바 필터
+# -----------------------------
+st.sidebar.header("필터")
 search = st.sidebar.text_input("상품코드/상품명 검색", "")
-
 dept_options = ["전체"] + sorted(df[COL_DEPT].dropna().astype(str).unique().tolist())
 selected_dept = st.sidebar.selectbox("소진 주관 부서", dept_options, index=0)
 
 f = df.copy()
-
 if selected_dept != "전체":
     f = f[f[COL_DEPT].astype(str) == selected_dept]
-
 if search.strip():
     s = search.strip().lower()
     f = f[
@@ -178,7 +235,6 @@ k1.metric("SKU 수", f"{sku_cnt:,}")
 k2.metric("1/1 기준재고 합", fmt_int(base_sum))
 k3.metric("가용재고 합", fmt_int(avail_sum))
 k4.metric("소진수량 합", fmt_int(cons_sum))
-
 k5.markdown(
     f"""
     <div style="text-align:center;">
@@ -190,15 +246,14 @@ k5.markdown(
     """,
     unsafe_allow_html=True,
 )
-
-st.caption("참고: 소진율(가중)=소진수량합 / 1/1기준재고합")
+st.caption("참고: 소진율(가중) = 소진수량합 / 1/1기준재고합")
 
 # -----------------------------
 # 1W~13W 소진수량 추이 (벡터화)
 # -----------------------------
 if week_cols:
     st.divider()
-    st.subheader("1W~13W 소진수량 추이 📈")
+    st.subheader("1W~13W 소진수량 추이")
 
     wk_sum = f[week_cols].sum(axis=0).astype(float)
     wk_df = pd.DataFrame({"주차": wk_sum.index, "소진수량": wk_sum.values})
@@ -213,35 +268,9 @@ if week_cols:
 # -----------------------------
 # 월별 소진 현황(부서별) - 소진율(가중)
 # -----------------------------
-def build_month_map():
-    """
-    현재 기준: 1~5W=1월, 6~9W=2월, 10~13W=3월
-    (시트 주차 컬럼이 더 생기면 여기만 확장)
-    """
-    return {
-        "1월": list(range(1, 6)),
-        "2월": list(range(6, 10)),
-        "3월": list(range(10, 14)),
-    }
-
-def month_rate_for_dept(ddf: pd.DataFrame, month_map: dict, week_cols_all: list) -> pd.DataFrame:
-    dept_base = float(ddf[COL_BASE].sum())
-    recs = []
-    for month, weeks in month_map.items():
-        cols = [c for c in week_cols_all if week_num(c) in weeks]
-        month_cons = float(ddf[cols].sum().sum()) if cols else 0.0
-        month_rate = (month_cons / dept_base * 100) if dept_base > 0 else 0.0
-        recs.append({"월": month, "소진율(가중)": month_rate})
-    out = pd.DataFrame(recs)
-    month_order = [f"{i}월" for i in range(1, 13)]
-    out["월"] = pd.Categorical(out["월"], categories=month_order, ordered=True)
-    return out.sort_values("월")
-
-if week_cols:
+if week_cols and month_map:
     st.divider()
-    st.subheader("월별 소진 현황 (부서별) 📊")
-
-    month_map = build_month_map()
+    st.subheader("월별 소진 현황 (부서별)")
 
     recs = []
     for dept, ddf in f.groupby(COL_DEPT, dropna=False):
@@ -276,7 +305,7 @@ if week_cols:
 # 부서(국가)별 요약
 # -----------------------------
 st.divider()
-st.subheader("부서(국가)별 요약 🧾")
+st.subheader("부서(국가)별 요약")
 
 grp = (
     f.groupby(COL_DEPT, dropna=False)
@@ -288,7 +317,6 @@ grp = (
     )
     .reset_index()
 )
-
 grp[COL_DEPT] = grp[COL_DEPT].astype(str).str.strip().replace({"": "(미기재)"}).fillna("(미기재)")
 grp["소진율(가중)"] = grp.apply(
     lambda r: (r["소진수량합"] / r["기준재고합"] * 100) if r["기준재고합"] > 0 else 0,
@@ -308,7 +336,7 @@ st.dataframe(grp_view, use_container_width=True, hide_index=True)
 # 상세 영역: 부서별 탭 + (월별 소진율 그래프) + (상/하위 5품목)
 # -----------------------------
 st.divider()
-st.subheader("상세 분석 (부서별) 🧩")
+st.subheader("상세 분석 (부서별)")
 
 dept_list = sorted(f[COL_DEPT].dropna().astype(str).unique().tolist())
 if not dept_list:
@@ -320,16 +348,14 @@ if selected_dept != "전체":
     dept_list = [selected_dept]
 
 tabs = st.tabs([f"{d}" for d in dept_list])
-month_map = build_month_map()
 
 for tab, dept in zip(tabs, dept_list):
     with tab:
         ddf = f[f[COL_DEPT].astype(str) == dept].copy()
 
         # (1) 월별 소진율(가중) 그래프
-        if week_cols:
+        if week_cols and month_map:
             mdf_dept = month_rate_for_dept(ddf, month_map, week_cols)
-
             fig_dept_m = px.line(
                 mdf_dept,
                 x="월",
@@ -343,12 +369,12 @@ for tab, dept in zip(tabs, dept_list):
         else:
             st.info("주차(1W~) 컬럼이 없어 월별 그래프를 표시할 수 없습니다.")
 
-        st.markdown("#### 소진율 상/하위 5 품목 🏁")
+        st.markdown("#### 소진율 상/하위 5 품목")
 
         # base=0 제외(소진율 왜곡 방지)
         items = ddf[ddf[COL_BASE] > 0].copy()
-
         show_cols = [COL_SKU, COL_NAME, COL_BASE, COL_AVAIL, "소진수량", "소진율(계산)"]
+
         left, right = st.columns(2)
 
         with left:
@@ -358,7 +384,6 @@ for tab, dept in zip(tabs, dept_list):
                 .head(5)[show_cols]
                 .copy()
             )
-
             if top5.empty:
                 st.write("- 데이터 없음")
             else:
@@ -370,17 +395,12 @@ for tab, dept in zip(tabs, dept_list):
 
         with right:
             st.markdown("**하위 5 (푸시 판매 후보)**")
-            # ✅ A안 반영:
-            # - 표시 대상: 가용재고 > 0
-            # - 랭킹 기준: 소진율(계산) 오름차순만
             bottom_pool = items[items[COL_AVAIL] > 0].copy()
-
             bottom5 = (
                 bottom_pool.sort_values("소진율(계산)", ascending=True)
                 .head(5)[show_cols]
                 .copy()
             )
-
             if bottom5.empty:
                 st.write("- 데이터 없음")
             else:
@@ -394,11 +414,9 @@ for tab, dept in zip(tabs, dept_list):
         with st.expander("부서 상세 데이터 전체 보기"):
             detail_cols = [COL_DEPT, COL_SKU, COL_NAME, COL_BASE, COL_AVAIL, "소진수량", COL_RATE, "소진율(계산)"]
             detail = ddf[detail_cols].copy()
-
             detail[COL_BASE] = detail[COL_BASE].map(fmt_int)
             detail[COL_AVAIL] = detail[COL_AVAIL].map(fmt_int)
             detail["소진수량"] = detail["소진수량"].map(fmt_int)
             detail[COL_RATE] = detail[COL_RATE].map(lambda x: fmt_pct(x, 1))
             detail["소진율(계산)"] = detail["소진율(계산)"].map(lambda x: fmt_pct(x, 1))
-
             st.dataframe(detail, use_container_width=True, hide_index=True)
